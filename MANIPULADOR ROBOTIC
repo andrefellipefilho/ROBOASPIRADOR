@@ -1,0 +1,206 @@
+import pybullet as p
+import pybullet_data
+import time
+import random
+import math
+import json
+import requests
+
+NODE_RED_URL = "http://localhost:1880/dados"
+
+def enviar_node_red(dados):
+    try:
+        requests.post(NODE_RED_URL, json=dados, timeout=0.5)
+    except:
+        pass
+
+
+# ===============================
+# CONFIGURAÇÕES
+# ===============================
+SIM_TIME = 180
+POINT_LIFETIME = 9.0
+WAIT_NEXT_POINT = 1.0
+DT = 1 / 240
+
+MAX_FORCE = 200
+TARGET_TOL = 0.03
+
+# ===============================
+# PYBULLET
+# ===============================
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.setGravity(0, 0, -9.8)
+p.setTimeStep(DT)
+
+p.loadURDF("plane.urdf")
+
+# ===============================
+# ROBÔ 6 DOF
+# ===============================
+robot = p.loadURDF("kuka_iiwa/model.urdf", useFixedBase=True)
+
+NUM_JOINTS = 6
+EE_LINK = 6
+
+# ===============================
+# POSIÇÃO INICIAL (HOME)
+# ===============================
+home_q = [p.getJointState(robot, j)[0] for j in range(NUM_JOINTS)]
+
+# ===============================
+# FUNÇÕES
+# ===============================
+def gerar_ponto():
+    R = 0.6
+    while True:
+        x = random.uniform(-R, R)
+        y = random.uniform(-R, R)
+        z = random.uniform(0.1, R)
+        if math.sqrt(x*x + y*y + z*z) <= R:
+            return [x, y, z]
+
+def distancia_ee(ponto):
+    pos = p.getLinkState(robot, EE_LINK)[0]
+    return math.dist(pos, ponto)
+
+def ir_para(q_ref):
+    for j in range(NUM_JOINTS):
+        p.setJointMotorControl2(
+            robot,
+            j,
+            p.POSITION_CONTROL,
+            targetPosition=q_ref[j],
+            force=MAX_FORCE
+        )
+
+def segurar_posicao():
+    for j in range(NUM_JOINTS):
+        q = p.getJointState(robot, j)[0]
+        p.setJointMotorControl2(
+            robot,
+            j,
+            p.POSITION_CONTROL,
+            targetPosition=q,
+            force=MAX_FORCE
+        )
+
+# ===============================
+# MÉTRICAS GERAIS
+# ===============================
+historico_resultados = []
+
+# ===============================
+# LOOP PRINCIPAL
+# ===============================
+start = time.time()
+pontos_pego = 0
+
+while time.time() - start < SIM_TIME:
+
+    # -------- MÉTRICAS DO CICLO --------
+    erros_ee = []
+    erros_juntas = [[] for _ in range(NUM_JOINTS)]
+    trajetoria = []
+    overshoot = [0.0] * NUM_JOINTS
+    energia = 0.0
+    ik_iteracoes = 0
+    ciclos_estaveis = 0
+    tempo_estabilizacao = None
+
+    # -------- GERA PONTO --------
+    alvo = gerar_ponto()
+    visual = p.createVisualShape(
+        p.GEOM_SPHERE, radius=0.03, rgbaColor=[1, 0, 0, 1]
+    )
+    ponto_id = p.createMultiBody(
+        baseVisualShapeIndex=visual, basePosition=alvo
+    )
+
+    t0 = time.time()
+    chegou = False
+    contou = False
+
+    # -------- LOOP DO ALVO --------
+    while time.time() - t0 < POINT_LIFETIME:
+
+        q_ref = p.calculateInverseKinematics(robot, EE_LINK, alvo)
+        ik_iteracoes += 1
+
+        if not chegou:
+            ir_para(q_ref)
+        else:
+            segurar_posicao()
+
+        p.stepSimulation()
+
+        pos_ee = p.getLinkState(robot, EE_LINK)[0]
+        trajetoria.append(pos_ee)
+
+        erro_ee = distancia_ee(alvo)
+        erros_ee.append(erro_ee)
+
+        for j in range(NUM_JOINTS):
+            q, qd, _, torque = p.getJointState(robot, j)
+            erro_j = abs(q_ref[j] - q)
+            erros_juntas[j].append(erro_j)
+            overshoot[j] = max(overshoot[j], erro_j)
+            energia += abs(torque) * DT
+
+        # ---- Estabilização ----
+        if erro_ee < TARGET_TOL:
+            ciclos_estaveis += 1
+        else:
+            ciclos_estaveis = 0
+
+        if ciclos_estaveis >= 30 and tempo_estabilizacao is None:
+            tempo_estabilizacao = time.time() - t0
+
+        time.sleep(DT)
+
+        if erro_ee < TARGET_TOL and not contou:
+            pontos_pego += 1
+            chegou = True
+            contou = True
+
+    # -------- BOLA SOME --------
+    p.removeBody(ponto_id)
+
+    # -------- CONSOLIDA MÉTRICAS --------
+    resultado = {
+        "alcancou": contou,
+        "erro_medio_ee": sum(erros_ee)/len(erros_ee),
+        "erro_medio_juntas": [sum(j)/len(j) for j in erros_juntas],
+        "tempo_estabilizacao": tempo_estabilizacao,
+        "overshoot_max_juntas": overshoot,
+        "energia_total": energia,
+        "ik_iteracoes": ik_iteracoes,
+        "trajetoria": trajetoria
+    }
+
+    historico_resultados.append(resultado)
+
+    # -------- VOLTA PARA HOME --------
+    t_home = time.time()
+    while time.time() - t_home < WAIT_NEXT_POINT:
+        ir_para(home_q)
+        p.stepSimulation()
+        time.sleep(DT)
+
+# ===============================
+# FINAL
+# ===============================
+print("Total de pontos alcançados:", pontos_pego)
+print("Último ciclo:")
+print(historico_resultados[-1])
+
+# ===============================
+# EXPORTA RESULTADOS (JSON)
+# ===============================
+with open("resultados_simulacao.json", "w") as f:
+    json.dump(historico_resultados, f, indent=4)
+
+print("Resultados exportados para resultados_simulacao.json")
+
+p.disconnect()
